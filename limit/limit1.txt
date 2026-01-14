@@ -1,0 +1,330 @@
+在半导体芯片测试（ATE）场景中，设备上报的数据往往具有**高频、瞬时并发量大**的特点。如果直接将所有请求涌入后端或 MQS（Message Queue Service），可能会导致系统雪崩或消息积压。
+
+采用**令牌桶（Token Bucket）**与**滑动窗口（Sliding Window）**的混合算法，可以同时兼顾“允许一定程度突发流量”和“严控固定时间窗口总量”的优点。
+
+以下是基于 Spring Boot + Redis + Lua 脚本实现的详细方案。
+
+---
+
+## 1. 核心思路
+
+* **滑动窗口**：用于限制单位时间内的绝对流量（例如：每秒严禁超过 1000 次），防止短时间内系统被压垮。
+* **令牌桶**：用于平滑流量并允许合法的突发请求（例如：平时每秒处理 500 个，但允许瞬间爆发到 800 个，只要桶里有令牌）。
+* **混合校验逻辑**：只有当请求同时通过“滑动窗口”和“令牌桶”的检查时，才允许执行业务逻辑。
+
+---
+
+## 2. 定义自定义注解 `@RateLimit`
+
+首先，定义一个注解，允许在 Controller 或 Service 方法上灵活配置参数。
+
+```java
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface RateLimit {
+    /**
+     * 限流Key的统计前缀
+     */
+    String key() default "rate_limit:";
+
+    /**
+     * 滑动窗口时间范围（单位：秒）
+     */
+    int windowSize() default 1;
+
+    /**
+     * 滑动窗口内最大请求数
+     */
+    int windowMaxRequests() default 100;
+
+    /**
+     * 令牌桶最大容量
+     */
+    int bucketCapacity() default 200;
+
+    /**
+     * 令牌桶每秒放入令牌速率
+     */
+    int bucketRefillRate() default 50;
+}
+
+```
+
+---
+
+## 3. 编写 Lua 脚本（混合算法核心）
+
+为了保证分布式环境下的原子性，我们将两种算法写在一个 Lua 脚本中。
+
+```lua
+-- Key 1: 滑动窗口 ZSet Key
+-- Key 2: 令牌桶 Hash Key (存储最后更新时间和当前令牌数)
+-- ARGV: [now_time, window_size, window_max, bucket_capacity, bucket_refill_rate]
+
+local now_time = tonumber(ARGV[1])
+local window_size = tonumber(ARGV[2])
+local window_max = tonumber(ARGV[3])
+local bucket_capacity = tonumber(ARGV[4])
+local bucket_refill_rate = tonumber(ARGV[5])
+
+-- 1. 处理滑动窗口逻辑
+local window_start = now_time - window_size
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, window_start) -- 移除过期窗口数据
+local current_window_count = redis.call('ZCARD', KEYS[1])
+
+if current_window_count >= window_max then
+    return 0 -- 触发滑动窗口限流
+end
+
+-- 2. 处理令牌桶逻辑
+local bucket_info = redis.call('HMGET', KEYS[2], 'last_time', 'tokens')
+local last_time = tonumber(bucket_info[1]) or now_time
+local current_tokens = tonumber(bucket_info[2]) or bucket_capacity
+
+-- 计算并补齐令牌
+local delta_time = math.max(0, now_time - last_time)
+local new_tokens = math.min(bucket_capacity, current_tokens + (delta_time * bucket_refill_rate))
+
+if new_tokens < 1 then
+    return -1 -- 触发令牌桶限流
+else
+    -- 3. 两个校验都通过，执行扣减和记录
+    redis.call('ZADD', KEYS[1], now_time, now_time) -- 记录滑动窗口
+    redis.call('HMSET', KEYS[2], 'last_time', now_time, 'tokens', new_tokens - 1)
+    -- 设置过期时间防止Key堆积
+    redis.call('EXPIRE', KEYS[1], window_size + 10)
+    redis.call('EXPIRE', KEYS[2], 60)
+    return 1
+end
+
+```
+
+---
+
+## 4. 实现 AOP 切面
+
+通过切面拦截带有 `@RateLimit` 注解的方法，调用 Redis 执行 Lua 脚本。
+
+```java
+@Aspect
+@Component
+public class RateLimitAspect {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    private DefaultRedisScript<Long> limitScript;
+
+    @PostConstruct
+    public void init() {
+        limitScript = new DefaultRedisScript<>();
+        limitScript.setSource(new ClassPathResource("lua/hybrid_limit.lua"));
+        limitScript.setResultType(Long.class);
+    }
+
+    @Around("@annotation(rateLimit)")
+    public Object around(ProceedingJoinPoint joinPoint, RateLimit rateLimit) throws Throwable {
+        // 构建Key，建议结合设备ID以实现针对设备的粒度限流
+        String keyName = rateLimit.key() + joinPoint.getSignature().getName();
+        List<String> keys = Arrays.asList(keyName + ":window", keyName + ":bucket");
+
+        long now = System.currentTimeMillis() / 1000;
+        
+        Long result = redisTemplate.execute(limitScript, keys, 
+                String.valueOf(now),
+                String.valueOf(rateLimit.windowSize()),
+                String.valueOf(rateLimit.windowMaxRequests()),
+                String.valueOf(rateLimit.bucketCapacity()),
+                String.valueOf(rateLimit.bucketRefillRate())
+        );
+
+        if (result != null && result == 1) {
+            return joinPoint.proceed();
+        } else {
+            // 根据业务需求抛出异常或自定义处理
+            throw new RuntimeException("系统繁忙，请稍后再试（限流拦截）");
+        }
+    }
+}
+
+```
+
+---
+
+## 5. 业务场景应用：芯片测试设备通信
+
+在芯片测试行业，通常需要根据设备上报的 `deviceId` 进行限流，以防止某一台故障设备产生的异常高频心跳或数据包压垮服务。
+
+你可以修改 AOP 逻辑，从方法参数中动态获取 `deviceId` 作为 Key 的一部分：
+
+```java
+@RateLimit(windowMaxRequests = 1000, bucketCapacity = 2000, bucketRefillRate = 500)
+public void handleDeviceMessage(DeviceMsg msg) {
+    // 1. 处理业务逻辑
+    // 2. 发送到 MQS
+    mqsTemplate.send(msg);
+}
+
+```
+
+### 方案优势
+
+1. **分层保护**：滑动窗口挡住超大流量冲击，令牌桶负责平滑处理。
+2. **分布式支持**：基于 Redis 共享状态，适用于多节点部署的服务。
+3. **高精度**：Lua 脚本保证了原子性，避免了在高并发下限流失效。
+4. **低延迟**：Redis 内存操作，对 ATE 这种对时效性有一定要求的行业非常友好。
+
+**您是否需要我为您补充关于如何从请求中动态解析设备 ID（SpEL 表达式支持）的代码实现？**
+
+
+支持 SpEL（Spring Expression Language）表达式后，你的限流注解将变得非常灵活。你可以根据请求参数中的 `deviceId`、`testOrderId` 甚至是 `header` 中的某个字段来进行**细粒度限流**。
+
+例如，针对不同的芯片测试台架（Station）设置不同的流量配额。
+
+---
+
+## 1. 升级自定义注解
+
+增加一个 `dynamicKey` 字段，用于接收 SpEL 表达式。
+
+```java
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface RateLimit {
+    /** 静态前缀 */
+    String key() default "rate_limit:";
+
+    /** SpEL 表达式，例如：#msg.deviceId */
+    String dynamicKey() default "";
+
+    int windowSize() default 1;
+    int windowMaxRequests() default 100;
+    int bucketCapacity() default 200;
+    int bucketRefillRate() default 50;
+}
+
+```
+
+---
+
+## 2. 编写 SpEL 解析工具类
+
+我们需要利用 Spring 提供的解析器来提取方法参数中的值。
+
+```java
+public class SpelUtil {
+    private static final ExpressionParser parser = new SpelExpressionParser();
+    private static final LocalVariableTableParameterNameDiscoverer discoverer = new LocalVariableTableParameterNameDiscoverer();
+
+    public static String parseKey(String spel, Method method, Object[] args) {
+        if (spel == null || spel.isEmpty()) return "";
+        
+        // 获取方法参数名
+        String[] params = discoverer.getParameterNames(method);
+        EvaluationContext context = new StandardEvaluationContext();
+        
+        // 将参数放入上下文
+        if (params != null) {
+            for (int i = 0; i < params.length; i++) {
+                context.setVariable(params[i], args[i]);
+            }
+        }
+        
+        // 解析表达式并返回字符串
+        return Objects.requireNonNull(parser.parseExpression(spel).getValue(context)).toString();
+    }
+}
+
+```
+
+---
+
+## 3. 升级 AOP 切面逻辑
+
+在切面中调用 `SpelUtil` 来构建最终的 Redis Key。
+
+```java
+@Around("@annotation(rateLimit)")
+public Object around(ProceedingJoinPoint joinPoint, RateLimit rateLimit) throws Throwable {
+    // 1. 获取方法签名和参数
+    MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+    Method method = signature.getMethod();
+    Object[] args = joinPoint.getArgs();
+
+    // 2. 解析动态 Key
+    String dynamicPart = SpelUtil.parseKey(rateLimit.dynamicKey(), method, args);
+    String finalKey = rateLimit.key() + signature.getDeclaringType().getSimpleName() + ":" + method.getName() + ":" + dynamicPart;
+
+    // 3. 构建 Redis Keys（维持之前的窗口和桶逻辑）
+    List<String> keys = Arrays.asList(finalKey + ":window", finalKey + ":bucket");
+
+    // 4. 执行 Lua 脚本
+    long now = System.currentTimeMillis() / 1000;
+    Long result = redisTemplate.execute(limitScript, keys, 
+            String.valueOf(now),
+            String.valueOf(rateLimit.windowSize()),
+            String.valueOf(rateLimit.windowMaxRequests()),
+            String.valueOf(rateLimit.bucketCapacity()),
+            String.valueOf(rateLimit.bucketRefillRate())
+    );
+
+    if (result != null && result == 1) {
+        return joinPoint.proceed();
+    } else {
+        // 建议：在 ATE 场景下，限流建议记录到日志，便于后续追溯是否因为限流导致了测试数据丢失
+        log.warn("设备 {} 触发限流策略", dynamicPart);
+        throw new RuntimeException("Device rate limit exceeded");
+    }
+}
+
+```
+
+---
+
+## 4. 业务场景应用示例
+
+在你的半导体测试业务逻辑中，你可以这样使用：
+
+### 场景 A：按设备 ID 限流
+
+防止某一台测试机台因为程序异常（如死循环发包）导致服务崩溃。
+
+```java
+@RateLimit(
+    dynamicKey = "#msg.deviceId", 
+    windowMaxRequests = 50, 
+    bucketCapacity = 100, 
+    bucketRefillRate = 10
+)
+public void processDeviceData(DeviceMessage msg) {
+    // 业务逻辑...
+}
+
+```
+
+### 场景 B：按测试类型（Batch）限流
+
+某些复杂的测试项（如涉及大量计算的 CP 测试）需要更严苛的限流。
+
+```java
+@RateLimit(
+    dynamicKey = "#testType", 
+    windowMaxRequests = 500
+)
+public void handleTestResult(String testType, TestData data) {
+    // 发送到 MQS...
+}
+
+```
+
+---
+
+## 5. 进阶建议：与 MQS 结合的抗压处理
+
+在半导体行业，**数据完整性**至关重要。如果触发了限流，直接丢弃数据（抛异常）可能会导致测试结果缺失。建议采取以下策略：
+
+1. **分级限流**：Controller 层进行第一道限流（混合算法），保护 Web 容器；在发送 MQS 之前，根据 MQ 的 **Backpressure（背压）** 状态动态调整发送速率。
+2. **本地缓冲**：如果被限流，可以将设备上报的数据临时写入本地的嵌入式数据库（如 SQLite）或磁盘文件，等待流量平稳后再异步补发。
+3. **监控告警**：通过 `redisTemplate.opsForValue().increment("rate_limit_metrics:" + deviceId)` 记录限流触发次数，并接入 Prometheus + Grafana。
+
+您是否需要我为您提供一个关于如何将限流后的请求放入“死信队列”或“本地重试方案”的设计建议？
