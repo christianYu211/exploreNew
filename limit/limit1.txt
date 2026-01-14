@@ -328,3 +328,123 @@ public void handleTestResult(String testType, TestData data) {
 3. **监控告警**：通过 `redisTemplate.opsForValue().increment("rate_limit_metrics:" + deviceId)` 记录限流触发次数，并接入 Prometheus + Grafana。
 
 您是否需要我为您提供一个关于如何将限流后的请求放入“死信队列”或“本地重试方案”的设计建议？
+
+
+针对半导体芯片测试（ATE）这种对数据精确度和系统稳定性要求极高的生产场景，我们需要设计多维度的测试案例。这些案例不仅要覆盖**算法正确性**，还要覆盖**分布式一致性**以及**生产环境下的异常容错**。
+
+以下是为您准备的生产级测试方案，建议使用 **JUnit 5 + Testcontainers (Redis)** 进行集成测试，并配合 **JMeter** 进行压力测试。
+
+---
+
+## 1. 核心功能测试 (Integration Tests)
+
+这类测试通过 `Testcontainers` 启动一个真实的 Redis 容器，验证 Lua 脚本逻辑。
+
+### 场景 1：滑动窗口瞬时突发限流
+
+* **目标**：验证在极短时间内（窗口期内）超过最大请求数是否被拦截。
+* **配置**：`windowMaxRequests = 10`, `windowSize = 1`。
+* **动作**：在 100ms 内发送 11 个请求。
+* **预期**：前 10 个成功，第 11 个抛出限流异常。
+
+### 场景 2：令牌桶平滑流控
+
+* **目标**：验证在窗口未满但令牌耗尽时的情况。
+* **配置**：`bucketCapacity = 5`, `bucketRefillRate = 1`（每秒 1 个）。
+* **动作**：瞬时发送 5 个请求（消耗完初始令牌），紧接着发送第 6 个。
+* **预期**：第 6 个请求被拦截；等待 1 秒后再次发送，请求应成功。
+
+### 场景 3：SpEL 动态 Key 隔离性
+
+* **目标**：确保不同设备（Device ID）之间的限流计数互不干扰。
+* **动作**：
+1. 对 `Device_001` 连续发送请求直至触发限流。
+2. 立即对 `Device_002` 发送 1 个请求。
+
+
+* **预期**：`Device_001` 被限流，但 `Device_002` 能够正常访问。
+
+---
+
+## 2. 生产并发与性能测试 (Concurrency Tests)
+
+针对 ATE 场景下成百上千台设备同时上报数据的压力模拟。
+
+### 场景 4：高并发争抢测试
+
+* **工具**：使用 `CountDownLatch` 或 `CompletableFuture` 模拟 100 个线程并发访问。
+* **目标**：验证 Lua 脚本在 Redis 中的原子性，确保不会因为并发导致“超发”令牌。
+* **预期**：通过 Redis 的 `ZCARD` 和 `HMGET` 检查，通过的总请求数严格等于 `windowMaxRequests` 和 `bucketCapacity` 的交集限制。
+
+### 场景 5：Lua 脚本执行时延
+
+* **目标**：确保限流逻辑不会成为业务瓶颈（ATE 场景对实时性要求高）。
+* **预期**：在 Redis 正常负载下，AOP 限流逻辑增加的 TP99 耗时应控制在 **2ms - 5ms** 以内。
+
+---
+
+## 3. 生产异常与容错测试 (Resilience Tests)
+
+### 场景 6：Redis 宕机容错 (Fail-Open)
+
+* **描述**：如果 Redis 集群突然挂了，不能让整个 ATE 数据采集线停摆。
+* **动作**：在测试代码中手动关闭 Redis 连接。
+* **预期**：切面捕获 Redis 异常，记录 Error 日志，并执行 `joinPoint.proceed()`（即：**降级为不限流**，保证业务优先）。
+
+### 场景 7：时钟漂移测试
+
+* **描述**：由于算法依赖 `System.currentTimeMillis()`，多台服务器时钟不一致可能导致限流不准。
+* **建议**：在 AOP 中改用 Redis 的 `TIME` 命令获取服务器统一时间，或者在测试用例中模拟服务器间 500ms 的时钟偏差，观察限流表现。
+
+---
+
+## 4. 自动化测试代码参考 (JUnit 5)
+
+```java
+@SpringBootTest
+@Testcontainers
+class RateLimitTest {
+
+    @Container
+    static GenericContainer redis = new GenericContainer("redis:6-alpine").withExposedPorts(6379);
+
+    @Autowired
+    private DeviceService deviceService; // 注入带有 @RateLimit 注解的服务
+
+    @Test
+    @DisplayName("混合算法：测试滑动窗口与令牌桶的叠加效应")
+    void testHybridLimit() throws InterruptedException {
+        DeviceMessage msg = new DeviceMessage("DEV_001", "DATA_HEX_...");
+        
+        // 1. 消耗掉所有初始令牌
+        for (int i = 0; i < 5; i++) {
+            assertDoesNotThrow(() -> deviceService.process(msg));
+        }
+
+        // 2. 立即发送第 6 个，预期失败 (令牌桶空)
+        assertThrows(RuntimeException.class, () -> deviceService.process(msg));
+
+        // 3. 等待令牌生成
+        Thread.sleep(1100); 
+        
+        // 4. 再次发送，预期成功
+        assertDoesNotThrow(() -> deviceService.process(msg));
+    }
+}
+
+```
+
+---
+
+## 5. ATE 行业特有的生产监控建议
+
+在生产环境中，除了测试用例，您还需要针对这个限流功能配置 **仪表盘（Dashboard）**：
+
+| 指标 (Metric) | 监控意义 |
+| --- | --- |
+| `rate_limit_hits_total` | 某台设备被限流的频率。如果频繁触发，说明设备可能有固件 Bug 或采样率设置不合理。 |
+| `mqs_backpressure_status` | 如果 MQS（消息队列）积压，应通过监控动态调低限流阈值。 |
+| `redis_lua_execution_time` | 监控 Lua 脚本执行时间，防止 Redis 慢查询影响 ATE 数据实时性。 |
+
+**下一步建议：**
+针对 ATE 场景，如果设备上报的数据非常重要，您是否需要我为您提供一个**“限流后自动进入持久化缓冲区（如本地磁盘）并在空闲时补发”**的具体实现方案？
