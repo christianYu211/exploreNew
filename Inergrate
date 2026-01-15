@@ -1,0 +1,247 @@
+为了确保您可以直接将此项目打包为 Spring Boot Starter SDK，我整理了最完整的目录结构和代码实现。代码基于 Spring Boot 3.x（Java 17），若您使用的是 2.x，仅需微调 AutoConfiguration 的配置方式即可。
+1. 目录结构预览
+rate-limit-spring-boot-starter/
+├── pom.xml
+└── src/
+    └── main/
+        ├── java/
+        │   └── com/yourcompany/ratelimit/
+        │       ├── annotation/
+        │       │   └── RateLimit.java
+        │       ├── aspect/
+        │       │   └── RateLimitAspect.java
+        │       ├── config/
+        │       │   └── RateLimitAutoConfiguration.java
+        │       ├── exception/
+        │       │   └── RateLimitException.java
+        │       └── utils/
+        │           └── SpelUtil.java
+        └── resources/
+            ├── META-INF/
+            │   └── spring/
+            │       └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
+            └── scripts/
+                └── hybrid_limit.lua
+
+2. 详细代码实现
+1) 自定义注解：RateLimit.java
+package com.yourcompany.ratelimit.annotation;
+
+import java.lang.annotation.*;
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+public @interface RateLimit {
+    /** 限流 Key 前缀 */
+    String key() default "rate_limit:";
+
+    /** SpEL 表达式，如：#msg.deviceId */
+    String dynamicKey() default "";
+
+    /** 滑动窗口时间范围（秒） */
+    int windowSize() default 1;
+
+    /** 滑动窗口内最大请求数 */
+    int windowMaxRequests() default 100;
+
+    /** 令牌桶最大容量 */
+    int bucketCapacity() default 200;
+
+    /** 令牌桶每秒放入令牌速率 */
+    int bucketRefillRate() default 50;
+}
+
+2) Lua 脚本：hybrid_limit.lua
+存放在 src/main/resources/scripts/ 目录下。
+-- KEYS[1]: 滑动窗口 ZSet Key
+-- KEYS[2]: 令牌桶 Hash Key
+-- ARGV[1]: 当前时间戳 (秒)
+-- ARGV[2]: 窗口大小 (秒)
+-- ARGV[3]: 窗口最大请求数
+-- ARGV[4]: 令牌桶容量
+-- ARGV[5]: 令牌生成速率
+
+local now_time = tonumber(ARGV[1])
+local window_size = tonumber(ARGV[2])
+local window_max = tonumber(ARGV[3])
+local bucket_capacity = tonumber(ARGV[4])
+local bucket_refill_rate = tonumber(ARGV[5])
+
+-- 1. 滑动窗口处理
+local window_start = now_time - window_size
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, window_start)
+local current_window_count = redis.call('ZCARD', KEYS[1])
+
+if current_window_count >= window_max then
+    return 0 -- 触发滑动窗口限流
+end
+
+-- 2. 令牌桶处理
+local bucket_info = redis.call('HMGET', KEYS[2], 'last_time', 'tokens')
+local last_time = tonumber(bucket_info[1]) or now_time
+local current_tokens = tonumber(bucket_info[2]) or bucket_capacity
+
+-- 计算新令牌
+local delta_time = math.max(0, now_time - last_time)
+local new_tokens = math.min(bucket_capacity, current_tokens + (delta_time * bucket_refill_rate))
+
+if new_tokens < 1 then
+    return -1 -- 触发令牌桶限流
+else
+    -- 执行原子扣减与记录
+    redis.call('ZADD', KEYS[1], now_time, now_time)
+    redis.call('HMSET', KEYS[2], 'last_time', now_time, 'tokens', new_tokens - 1)
+    redis.call('EXPIRE', KEYS[1], window_size + 10)
+    redis.call('EXPIRE', KEYS[2], 60)
+    return 1 -- 放行
+end
+
+3) SpEL 解析工具：SpelUtil.java
+package com.yourcompany.ratelimit.utils;
+
+import org.springframework.core.DefaultParameterNameDiscoverer;
+import org.springframework.expression.EvaluationContext;
+import org.springframework.expression.ExpressionParser;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
+import org.springframework.expression.spel.support.StandardEvaluationContext;
+import java.lang.reflect.Method;
+import java.util.Objects;
+
+public class SpelUtil {
+    private static final ExpressionParser parser = new SpelExpressionParser();
+    private static final DefaultParameterNameDiscoverer discoverer = new DefaultParameterNameDiscoverer();
+
+    public static String parseKey(String spel, Method method, Object[] args) {
+        if (spel == null || spel.isEmpty()) return "";
+        String[] params = discoverer.getParameterNames(method);
+        EvaluationContext context = new StandardEvaluationContext();
+        if (params != null) {
+            for (int i = 0; i < params.length; i++) {
+                context.setVariable(params[i], args[i]);
+            }
+        }
+        return Objects.requireNonNull(parser.parseExpression(spel).getValue(context)).toString();
+    }
+}
+
+4) AOP 切面实现：RateLimitAspect.java
+包含 Fail-Open（异常降级） 逻辑。
+package com.yourcompany.ratelimit.aspect;
+
+import com.yourcompany.ratelimit.annotation.RateLimit;
+import com.yourcompany.ratelimit.exception.RateLimitException;
+import com.yourcompany.ratelimit.utils.SpelUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import java.util.Arrays;
+import java.util.List;
+
+@Slf4j
+@Aspect
+public class RateLimitAspect {
+
+    private final StringRedisTemplate redisTemplate;
+    private final DefaultRedisScript<Long> limitScript;
+
+    public RateLimitAspect(StringRedisTemplate redisTemplate, DefaultRedisScript<Long> limitScript) {
+        this.redisTemplate = redisTemplate;
+        this.limitScript = limitScript;
+    }
+
+    @Around("@annotation(rateLimit)")
+    public Object around(ProceedingJoinPoint joinPoint, RateLimit rateLimit) throws Throwable {
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        String dynamicKeyPart = SpelUtil.parseKey(rateLimit.dynamicKey(), signature.getMethod(), joinPoint.getArgs());
+        
+        String baseKey = rateLimit.key() + signature.getDeclaringType().getSimpleName() + ":" + signature.getMethod().getName() + ":" + dynamicKeyPart;
+        List<String> keys = Arrays.asList(baseKey + ":window", baseKey + ":bucket");
+
+        try {
+            Long now = System.currentTimeMillis() / 1000;
+            Long result = redisTemplate.execute(limitScript, keys,
+                    String.valueOf(now),
+                    String.valueOf(rateLimit.windowSize()),
+                    String.valueOf(rateLimit.windowMaxRequests()),
+                    String.valueOf(rateLimit.bucketCapacity()),
+                    String.valueOf(rateLimit.bucketRefillRate())
+            );
+
+            if (result != null && result == 1) {
+                return joinPoint.proceed();
+            } else {
+                log.warn("Rate limit hit for key: {}", baseKey);
+                throw new RateLimitException("Too many requests, please try again later.");
+            }
+        } catch (RateLimitException e) {
+            throw e;
+        } catch (Exception e) {
+            // Fail-Open: Redis 异常时直接放行，保证芯片测试业务不中断
+            log.error("Rate limiter fallback (Fail-Open) due to Redis error: {}", e.getMessage());
+            return joinPoint.proceed();
+        }
+    }
+}
+
+5) 自动配置类：RateLimitAutoConfiguration.java
+package com.yourcompany.ratelimit.config;
+
+import com.yourcompany.ratelimit.aspect.RateLimitAspect;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.context.annotation.Bean;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+
+@AutoConfiguration
+@ConditionalOnClass(StringRedisTemplate.class)
+public class RateLimitAutoConfiguration {
+
+    @Bean
+    public DefaultRedisScript<Long> rateLimitLuaScript() {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setLocation(new ClassPathResource("scripts/hybrid_limit.lua"));
+        script.setResultType(Long.class);
+        return script;
+    }
+
+    @Bean
+    public RateLimitAspect rateLimitAspect(StringRedisTemplate redisTemplate, DefaultRedisScript<Long> rateLimitLuaScript) {
+        return new RateLimitAspect(redisTemplate, rateLimitLuaScript);
+    }
+}
+
+6) SPI 注册文件
+在 src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports 中写入：
+com.yourcompany.ratelimit.config.RateLimitAutoConfiguration
+
+3. 业务方如何使用
+业务方引入您的 SDK 后，直接在代码中通过 SpEL 绑定设备 ID：
+@Service
+public class ChipTestService {
+
+    // 限制每 10 秒内同一设备最多上报 500 次，且允许 1000 次的突发流量
+    @RateLimit(
+        dynamicKey = "#msg.deviceId", 
+        windowSize = 10, 
+        windowMaxRequests = 500, 
+        bucketCapacity = 1000, 
+        bucketRefillRate = 50
+    )
+    public void handleDeviceMessage(DeviceMsg msg) {
+        // 执行芯片测试逻辑并发送到 MQS
+    }
+}
+
+4. 总结
+该方案针对您的半导体芯片测试场景做了专门优化：
+ * 混合算法：兼顾了突发流量的处理与总量的严格锁定。
+ * 动态隔离：基于设备 ID（deviceId）实现精细化流控，避免单台故障设备影响全局。
+ * 高可用保障：集成了 Fail-Open 逻辑，Redis 宕机时业务不掉线。
+您是否需要我为您提供一个针对该 SDK 的全局异常拦截器（ControllerAdvice），以便将限流异常友好地转化为 JSON 返回给前端或设备端？
