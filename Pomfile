@@ -1,0 +1,107 @@
+为了确保你的 SDK 具有良好的兼容性并符合 Spring Boot Starter 的开发规范，这份 pom.xml 采用了 Spring Boot 3.x 的标准进行配置（兼容 Java 17+）。
+它包含了两部分核心逻辑：
+ * 依赖控制：通过 optional 标签防止依赖污染。
+ * 配置处理器：自动生成元数据，让使用者在编写 yaml 时有代码提示。
+1. 完整的 pom.xml 配置
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.yourcompany.framework</groupId>
+    <artifactId>rate-limit-spring-boot-starter</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>rate-limit-spring-boot-starter</name>
+    <description>基于 Redis + Lua 的滑动窗口与令牌桶混合限流 SDK</description>
+
+    <properties>
+        <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <spring-boot.version>3.2.0</spring-boot.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+            <version>${spring-boot.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+            <version>${spring-boot.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+            <version>${spring-boot.version}</version>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <version>${spring-boot.version}</version>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.30</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <version>${spring-boot.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+                <version>3.3.0</version>
+                <executions>
+                    <execution>
+                        <id>attach-sources</id>
+                        <goals>
+                            <goal>jar-no-fork</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+2. 关键设计说明
+ * <optional>true</optional> 的作用：
+   这是 Starter 开发的核心。比如 spring-boot-starter-data-redis，如果设为可选，当业务项目引入你的 SDK 时，Maven 不会强制下载 Redis 包。这避免了版本冲突（业务项目可能已经有更高版本的 Redis），同时也减小了依赖体积。
+ * spring-boot-configuration-processor：
+   这个插件非常重要。当你定义了 @ConfigurationProperties 类后，编译阶段它会生成一个 JSON 文件。这样别人在使用你的 SDK 时，在 application.yml 里输入 ratelimit.xxx 就会出现补全提示。
+ * maven-source-plugin：
+   对于 SDK 来说，将源码打包发布（-sources.jar）能极大地提升开发者体验。当业务方在 IDE 中点击你的注解时，可以直接看到 Java 源码和注释，而不是反编译后的字节码。
+3. 下一步：如何发布与测试？
+ * 本地测试：在 SDK 项目根目录执行 mvn clean install。这会将 JAR 包安装到你的本地 .m2 仓库。
+ * 创建测试 Demo：新建一个简单的 Spring Boot 项目，引入上述 GAV（GroupId, ArtifactId, Version）。
+ * 验证自动配置：启动 Demo 项目，看控制台是否打印了你切面中的 init 日志，确认 Lua 脚本是否加载成功。
+你需要我为你补充一个 README.md 模板吗？这可以指导你的同事如何配置这个 SDK。
